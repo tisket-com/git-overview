@@ -11,6 +11,9 @@ Tisket uses a hybrid client-server git architecture that enables a responsive, o
 │  │ BrowserGitContext│  │  isomorphic-git │  │ LightningFS  │ │
 │  │  (React Context) │──│  (Git Engine)   │──│ (IndexedDB)  │ │
 │  └─────────────────┘  └─────────────────┘  └──────────────┘ │
+│  ┌─────────────────┐                                           │
+│  │ tRPC/React Query│  (Server data caching)                   │
+│  └─────────────────┘                                           │
 └───────────────────────────┬─────────────────────────────────┘
                             │ HTTP/SSE
 ┌───────────────────────────┴─────────────────────────────────┐
@@ -28,6 +31,7 @@ Tisket uses a hybrid client-server git architecture that enables a responsive, o
 2. **Graceful Degradation**: Falls back to GitHub API when local operations fail
 3. **Real-Time Sync**: Server-Sent Events push commits to all connected clients
 4. **Optimistic Updates**: Changes appear immediately, sync happens in background
+5. **Smart Caching**: tRPC/React Query for server data, LightningFS for git content
 
 ## Documentation Structure
 
@@ -36,4 +40,6 @@ Tisket uses a hybrid client-server git architecture that enables a responsive, o
 - [Diff Viewing](diff-viewing.md) - Comparing file versions
 - [Commit History](commit-history.md) - Timeline and version tracking
 - [Real-Time Updates](realtime-updates.md) - SSE and live sync
+- [Caching Strategy](caching-strategy.md) - How data stays fresh
 - [Server Operations](server-operations.md) - API endpoints and fallbacks
+- [Key Files](key-files.md) - Quick reference to source files
