@@ -2,7 +2,7 @@
 
 Tisket uses a hybrid client-server git architecture that enables a responsive, offline-capable experience while maintaining sync with GitHub.
 
-> **Last updated:** January 2026 - Now with 500ms SSE polling for faster updates
+> **Last updated:** January 2026 - Testing instant SSE updates!
 
 ## Architecture Summary
 
