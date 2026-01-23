@@ -38,6 +38,15 @@ interface CommitEvent {
     }>;
   };
 }
+
+interface WorkspaceEvent {
+  type: "workspace";
+  action: "repo_added" | "repo_removed" | "updated";
+  workspaceId: string;
+  workspaceSlug: string;
+  repoSlug?: string;
+  repoType?: "project" | "team";
+}
 ```
 
 ## Client-Side Handling
@@ -46,8 +55,15 @@ interface CommitEvent {
 
 ```typescript
 function useRealtimeEvents() {
+  const queryClient = useQueryClient();
+  
   useEffect(() => {
     const eventSource = new EventSource("/api/events");
+    
+    eventSource.onopen = () => {
+      // Invalidate cache on reconnect to catch missed events
+      queryClient.invalidateQueries({ queryKey: [["repos"]] });
+    };
     
     eventSource.onmessage = (event) => {
       const data = JSON.parse(event.data);
@@ -59,7 +75,66 @@ function useRealtimeEvents() {
 }
 ```
 
-### Applying Commits
+### Cache Invalidation on Events
+
+When workspace events arrive, the tRPC cache is invalidated:
+
+```typescript
+function handleEvents(events: TisketEvent[]) {
+  for (const event of events) {
+    if (event.type === "commit") {
+      await onCommit(event);
+    } else if (event.type === "workspace") {
+      // Invalidate repos cache - triggers refetch
+      queryClient.invalidateQueries({ queryKey: [["repos"]] });
+    }
+  }
+}
+```
+
+## Handling Missed Events
+
+SSE only delivers events while connected. To handle missed events:
+
+### 1. Refetch on Window Focus
+
+The repos list uses tRPC query with automatic refetch:
+
+```typescript
+const { data: availableRepos } = trpc.repos.list.useQuery(undefined, {
+  refetchOnWindowFocus: true,  // Refetch when user returns to tab
+  staleTime: 30_000,           // Consider fresh for 30 seconds
+});
+```
+
+### 2. Refetch on SSE Reconnect
+
+When SSE connection is re-established:
+
+```typescript
+eventSource.onopen = () => {
+  queryClient.invalidateQueries({ queryKey: [["repos"]] });
+};
+```
+
+### 3. Git Content Sync
+
+For file content, the client syncs with GitHub on page load:
+
+```typescript
+async initialize(): Promise<void> {
+  const existingRepo = await this.checkExistingRepo();
+  if (existingRepo) {
+    await this.checkRemoteAndSync();  // Sync with remote
+  } else {
+    await this.bootstrap();  // Clone fresh
+  }
+}
+```
+
+This ensures file content is always up-to-date, regardless of missed SSE events.
+
+## Applying Commits
 
 ```typescript
 async applyCommit(commitData: CommitEvent): Promise<void> {
