@@ -2,6 +2,8 @@
 
 Tisket uses a hybrid client-server git architecture that enables a responsive, offline-capable experience while maintaining sync with GitHub.
 
+> **Last updated:** January 2026 - Added tRPC caching layer for automatic cache invalidation
+
 ## Architecture Summary
 
 ```
