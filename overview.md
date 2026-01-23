@@ -2,7 +2,7 @@
 
 Tisket uses a hybrid client-server git architecture that enables a responsive, offline-capable experience while maintaining sync with GitHub.
 
-> **Last updated:** January 2026 - Testing SSE with console logging active
+> **Last updated:** January 2026 - Fixed OID matching for SSE commits
 
 ## Architecture Summary
 
