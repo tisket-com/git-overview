@@ -1,116 +1,172 @@
 # Repository Management
 
-How repositories are cloned, stored, and accessed in the browser.
+How repositories are initialized and synced in the browser.
 
-## Initialization Flow
+## Bootstrap via Git Clone
 
-When a user navigates to a workspace, repositories are initialized:
-
-```
-1. User navigates to workspace
-   ↓
-2. BrowserGitProvider mounts
-   ↓
-3. ensureRepo(repoSlug) called for each repo
-   ↓
-4. BrowserGitRepo.initialize()
-   ├─ Check for existing repo in LightningFS
-   ├─ If exists: checkRemoteAndSync()
-   └─ If not: bootstrap()
-   ↓
-5. Repo ready → UI updates
-```
-
-## Cloning Methods
-
-### Primary: Git Clone
+When a repository is first accessed, it's cloned directly from the git server:
 
 ```typescript
-await git.clone({
-  fs: this.fs,
-  http: http,
-  dir: this.dir,
-  url: `/api/git/${repoSlug}`,  // Proxied to MCP server
-  depth: 1,
-  singleBranch: true,
-  ref: "main"
-});
-```
+async bootstrap(): Promise<string | null> {
+  const url = getGitUrl(this.repoSlug);
 
-The server proxies git protocol requests to the MCP server, which has GitHub credentials.
+  await this.wipe();
+  await ensureDir(this.fs, this.dir);
 
-### Fallback: API Bootstrap
+  await git.clone({
+    fs: this.fs,
+    http,
+    dir: this.dir,
+    url,
+    ref: "main",
+    singleBranch: true,
+    depth: 50,
+  });
 
-If git clone fails (e.g., CORS issues, network problems):
+  const commits = await git.log({ fs: this.fs, dir: this.dir, depth: 1 });
+  const headSha = commits[0]?.oid || null;
 
-```typescript
-// Fetch file tree from API
-const response = await fetch(`/api/repo-bootstrap?repo=${repoSlug}`);
-const { files } = await response.json();
+  if (headSha) {
+    await this.writeSyncMetadata({ remoteHead: headSha });
+  }
 
-// Create repo manually
-await git.init({ fs: this.fs, dir: this.dir });
-
-// Add all files
-for (const file of files) {
-  await this.fs.promises.writeFile(
-    `${this.dir}/${file.path}`,
-    file.content
-  );
-  await git.add({ fs: this.fs, dir: this.dir, filepath: file.path });
+  return headSha;
 }
-
-// Create initial commit
-await git.commit({
-  fs: this.fs,
-  dir: this.dir,
-  message: "Initial commit (bootstrapped)",
-  author: { name: "Tisket", email: "system@tisket.com" }
-});
 ```
+
+### Key Points
+
+- Uses `git.clone()` to get real git objects with correct OIDs
+- Clones with `depth: 50` to get recent history
+- Single branch mode for efficiency
+- Stores head SHA in sync metadata
+
+## Storage
+
+Each repository is stored in its own LightningFS instance backed by IndexedDB:
+
+```typescript
+const fsInstances = new Map<string, LightningFS>();
+
+function getFS(repoSlug: string): LightningFS {
+  if (!fsInstances.has(repoSlug)) {
+    fsInstances.set(repoSlug, new LightningFS(`tisket-${repoSlug}`));
+  }
+  return fsInstances.get(repoSlug)!;
+}
+```
+
+Data persists across page reloads and browser sessions.
 
 ## Sync Metadata
 
-Each repo stores sync state in a `.tisket-sync` file:
+A `.tisket-sync` file tracks the last known remote head:
 
-```json
-{
-  "remoteHead": "abc123...",
-  "appliedCommits": ["def456...", "ghi789..."]
+```typescript
+interface SyncMetadata {
+  remoteHead: string;
+}
+
+private async writeSyncMetadata(metadata: SyncMetadata): Promise<void> {
+  await this.fs.promises.writeFile(
+    `${this.dir}/${SYNC_FILE}`,
+    JSON.stringify(metadata),
+    "utf8"
+  );
 }
 ```
 
-This tracks:
-- The last known remote HEAD commit
-- Commits applied via SSE (to avoid duplicates)
+## Real-Time Updates via Fetch
 
-## Repo State
+When an SSE commit event arrives, the client fetches new objects:
 
 ```typescript
-interface RepoState {
-  repo: BrowserGitRepo;    // The repo instance
-  head: string | null;     // Current HEAD commit
-  isReady: boolean;        // Initialization complete
-  isCloning: boolean;      // Currently cloning
-}
-```
-
-Repos are stored in a Map keyed by slug:
-
-```typescript
-const repos = new Map<string, RepoState>();
-```
-
-## Active Repo Persistence
-
-The `activeRepoSlug` persists during navigation to prevent timeline reloads:
-
-```typescript
-// When navigating between files in the same repo,
-// the timeline doesn't reload
-useEffect(() => {
-  if (currentFile?.repoSlug && currentFile.repoSlug !== activeRepoSlug) {
-    setActiveRepoSlug(currentFile.repoSlug);
+async applyCommit(commitData: CommitData): Promise<string | null> {
+  // Check if commit already exists
+  if (await this.commitExists(commitData.oid)) {
+    await this.checkoutCommit(commitData.oid);
+    return null;
   }
-}, [currentFile?.repoSlug]);
+
+  // Fetch new objects and sync
+  return this.fetchAndSync(commitData.oid);
+}
+
+private async fetchAndSync(targetOid: string): Promise<string | null> {
+  const url = getGitUrl(this.repoSlug);
+
+  await git.fetch({
+    fs: this.fs,
+    http,
+    dir: this.dir,
+    url,
+    ref: "main",
+    singleBranch: true,
+  });
+
+  await git.writeRef({
+    fs: this.fs,
+    dir: this.dir,
+    ref: "refs/heads/main",
+    value: targetOid,
+    force: true,
+  });
+
+  await this.checkoutCommit(targetOid);
+  await this.writeSyncMetadata({ remoteHead: targetOid });
+
+  return targetOid;
+}
 ```
+
+## Git Object Integrity
+
+By using `git.clone()` and `git.fetch()`, all git objects maintain proper integrity:
+
+| Operation | Result |
+|-----------|--------|
+| `git.clone()` | Real commit/tree/blob objects with correct OIDs |
+| `git.fetch()` | Fetches new objects, OIDs match upstream |
+| `git.checkout()` | Updates working directory from objects |
+| `readCommit(oid)` | Works for any commit in history |
+| `readFileAtCommit()` | Works for any file at any commit |
+
+## History Access
+
+With real git history, all operations work locally:
+
+```typescript
+async log(depth: number = 50): Promise<GitCommit[]> {
+  const commits = await git.log({ fs: this.fs, dir: this.dir, ref: "main", depth });
+  return commits.map((c) => ({
+    oid: c.oid,
+    message: c.commit.message,
+    author: c.commit.author.name,
+    timestamp: c.commit.author.timestamp * 1000,
+  }));
+}
+
+async getFileHistory(filepath: string, depth: number = 50): Promise<GitCommit[]> {
+  const result: GitCommit[] = [];
+  const commits = await git.log({ fs: this.fs, dir: this.dir, ref: "main", depth });
+
+  for (const commit of commits) {
+    try {
+      await git.readBlob({ fs: this.fs, dir: this.dir, oid: commit.oid, filepath });
+      result.push({ ... });
+    } catch {
+      // File didn't exist at this commit
+    }
+  }
+
+  return result;
+}
+```
+
+## Clearing Cache
+
+To force a fresh clone, clear IndexedDB:
+
+1. Open DevTools > Application > IndexedDB
+2. Delete databases starting with `tisket-`
+3. Refresh the page
