@@ -7,13 +7,14 @@ How changes sync across clients using Server-Sent Events.
 ```
 ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
 │  MCP Server  │────▶│  Web Server  │────▶│   Browser    │
-│  (commits)   │     │   (SSE)      │     │  (applies)   │
+│  (commits)   │     │   (SSE)      │     │  (fetches)   │
 └──────────────┘     └──────────────┘     └──────────────┘
 ```
 
 1. MCP server creates a commit and pushes to GitHub
-2. Server emits SSE event with commit data
-3. Browser receives event and applies commit locally
+2. Server emits SSE event with commit metadata
+3. Browser receives event and fetches git objects from server
+4. Working directory is updated via git checkout
 
 ## Event Types
 
@@ -26,17 +27,19 @@ type RealtimeEvent =
 interface CommitEvent {
   type: "commit";
   repoSlug: string;
-  commit: {
-    oid: string;
-    message: string;
-    author: string;
-    timestamp: number;
-    files: Array<{
-      path: string;
-      content: string | null;  // null = deleted
-      changeType: GitFileChangeType;
-    }>;
-  };
+  oid: string;
+  message: string;
+  author: { name: string; email: string };
+  timestamp: number;
+  files: Array<{
+    path: string;
+    content: string | null;
+    changeType: GitFileChangeType;
+  }>;
+  tree: string;
+  parent: string[];
+  gitAuthor: GitAuthor;
+  gitCommitter: GitAuthor;
 }
 
 interface WorkspaceEvent {
@@ -61,7 +64,6 @@ function useRealtimeEvents() {
     const eventSource = new EventSource("/api/events");
     
     eventSource.onopen = () => {
-      // Invalidate cache on reconnect to catch missed events
       queryClient.invalidateQueries({ queryKey: [["repos"]] });
     };
     
@@ -85,12 +87,90 @@ function handleEvents(events: TisketEvent[]) {
     if (event.type === "commit") {
       await onCommit(event);
     } else if (event.type === "workspace") {
-      // Invalidate repos cache - triggers refetch
       queryClient.invalidateQueries({ queryKey: [["repos"]] });
     }
   }
 }
 ```
+
+## Applying Commits (Git Fetch Approach)
+
+When an SSE commit event arrives, the client uses proper git fetch to sync:
+
+```typescript
+async applyCommit(commitData: CommitData): Promise<string | null> {
+  // Check if commit already exists locally
+  if (await this.commitExists(commitData.oid)) {
+    await this.checkoutCommit(commitData.oid);
+    return null;
+  }
+
+  // Fetch git objects from server
+  const newHead = await this.fetchAndSync(commitData.oid);
+  return newHead;
+}
+
+private async fetchAndSync(targetOid: string): Promise<string | null> {
+  const url = getGitUrl(this.repoSlug);
+
+  // Fetch actual git objects (blobs, trees, commits)
+  await git.fetch({
+    fs: this.fs,
+    http,
+    dir: this.dir,
+    url,
+    ref: "main",
+    singleBranch: true,
+  });
+
+  // Update local ref to point to new commit
+  await git.writeRef({
+    fs: this.fs,
+    dir: this.dir,
+    ref: "refs/heads/main",
+    value: targetOid,
+    force: true,
+  });
+
+  // Update working directory
+  await this.checkoutCommit(targetOid);
+
+  await this.writeSyncMetadata({ remoteHead: targetOid });
+  return targetOid;
+}
+
+private async checkoutCommit(oid: string): Promise<void> {
+  await git.checkout({
+    fs: this.fs,
+    dir: this.dir,
+    ref: oid,
+    force: true,
+  });
+}
+```
+
+### Why Git Fetch?
+
+The previous approach tried to reconstruct git objects locally from file content sent via SSE. This caused OID mismatches because:
+
+- Blob OIDs depend on exact byte content
+- Tree OIDs depend on exact structure and child OIDs
+- Commit OIDs depend on tree, parents, author, committer, message
+
+If any detail differed, local OIDs wouldn't match upstream, breaking:
+- `readCommit(oid)` lookups
+- Diff viewing between commits
+- History navigation
+
+The git fetch approach downloads the actual git objects from the server, preserving exact OIDs.
+
+### Performance
+
+Git fetch is efficient for incremental updates:
+- Only downloads objects not already present locally
+- Uses delta compression
+- For a single-file commit: ~1-5KB transfer
+- Mostly network latency (~100-500ms)
 
 ## Handling Missed Events
 
@@ -98,18 +178,14 @@ SSE only delivers events while connected. To handle missed events:
 
 ### 1. Refetch on Window Focus
 
-The repos list uses tRPC query with automatic refetch:
-
 ```typescript
 const { data: availableRepos } = trpc.repos.list.useQuery(undefined, {
-  refetchOnWindowFocus: true,  // Refetch when user returns to tab
-  staleTime: 30_000,           // Consider fresh for 30 seconds
+  refetchOnWindowFocus: true,
+  staleTime: 30_000,
 });
 ```
 
 ### 2. Refetch on SSE Reconnect
-
-When SSE connection is re-established:
 
 ```typescript
 eventSource.onopen = () => {
@@ -117,91 +193,62 @@ eventSource.onopen = () => {
 };
 ```
 
-### 3. Git Content Sync
+### 3. Bootstrap on Diff Exit
 
-For file content, the client syncs with GitHub on page load:
+When exiting diff view, the repo is refreshed to catch any missed updates:
 
 ```typescript
-async initialize(): Promise<void> {
-  const existingRepo = await this.checkExistingRepo();
-  if (existingRepo) {
-    await this.checkRemoteAndSync();  // Sync with remote
-  } else {
-    await this.bootstrap();  // Clone fresh
+const clearDiffMode = useCallback(() => {
+  // ... clear diff state ...
+  
+  if (repoSlugToRefresh) {
+    const repoState = reposRef.current.get(repoSlugToRefresh);
+    if (repoState?.repo) {
+      repoState.repo.bootstrap().then((newHead) => {
+        if (newHead) {
+          repoState.head = newHead;
+          incrementVersion();
+        }
+      });
+    }
   }
-}
+}, [navigate, selectedCommitRepoSlug]);
 ```
 
-This ensures file content is always up-to-date, regardless of missed SSE events.
+### 4. Fallback to Bootstrap
 
-## Applying Commits
+If git fetch fails for any reason, the system falls back to a full bootstrap:
 
 ```typescript
-async applyCommit(commitData: CommitEvent): Promise<void> {
-  // Check if already applied
-  if (this.appliedCommits.has(commitData.commit.oid)) {
-    return;
+async applyCommit(commitData: CommitData): Promise<string | null> {
+  try {
+    const newHead = await this.fetchAndSync(commitData.oid);
+    return newHead;
+  } catch (e) {
+    console.error("Apply commit error:", e);
+    return this.bootstrap();  // Full resync as fallback
   }
-  
-  // Ensure local branch exists
-  await this.ensureLocalBranch();
-  
-  // Write files to LightningFS
-  for (const file of commitData.commit.files) {
-    if (file.content === null) {
-      await this.fs.promises.unlink(`${this.dir}/${file.path}`);
-    } else {
-      await this.fs.promises.writeFile(
-        `${this.dir}/${file.path}`,
-        file.content
-      );
-    }
-  }
-  
-  // Build git tree and create commit
-  await git.add({ fs: this.fs, dir: this.dir, filepath: "." });
-  await git.commit({
-    fs: this.fs,
-    dir: this.dir,
-    message: commitData.commit.message,
-    author: {
-      name: commitData.commit.author,
-      email: "system@tisket.com"
-    }
-  });
-  
-  // Track as applied
-  this.appliedCommits.add(commitData.commit.oid);
-  await this.saveSyncMetadata();
-  
-  // Trigger UI update
-  this.incrementVersion();
 }
 ```
 
 ## Recently Changed Files
 
-After applying a commit, files are marked as recently changed:
+After applying a commit, files are marked as recently changed for UI highlighting:
 
 ```typescript
-const recentlyChangedFiles = new Map<string, number>();
-
-function handleCommit(event: CommitEvent) {
-  for (const file of event.commit.files) {
-    const key = `${event.repoSlug}:${file.path}`;
-    recentlyChangedFiles.set(key, Date.now());
+setRecentlyChangedFiles(prev => {
+  const next = new Map(prev);
+  for (const file of commit.files) {
+    const key = `${commit.repoSlug}:${file.path}`;
+    next.set(key, {
+      changeType: file.changeType ?? "modified",
+      timestamp: Date.now(),
+      commitOid: commit.oid,
+    });
   }
-  
-  // Clear after 5 seconds
-  setTimeout(() => {
-    for (const file of event.commit.files) {
-      recentlyChangedFiles.delete(`${event.repoSlug}:${file.path}`);
-    }
-  }, 5000);
-}
+  return next;
+});
 ```
-
-This enables UI highlighting of recently changed files in the sidebar.
 
 ## Timeline Updates
 
@@ -211,29 +258,31 @@ When a commit arrives, timelines are updated:
 function handleCommit(event: CommitEvent) {
   // Add to repo timeline
   setRepoTimeline(prev => [
-    {
-      oid: event.commit.oid,
-      message: event.commit.message,
-      author: event.commit.author,
-      timestamp: event.commit.timestamp
-    },
+    { oid: event.oid, message: event.message, author: event.author.name, timestamp: event.timestamp },
     ...prev
   ]);
   
   // Update file timeline if current file was affected
-  if (currentFile && event.commit.files.some(f => f.path === currentFile.filePath)) {
+  if (currentFile && event.files.some(f => f.path === currentFile.filePath)) {
     setFileTimeline(prev => [/* new commit */, ...prev]);
   }
+  
+  incrementVersion();  // Trigger UI refresh
 }
 ```
 
-## Branch Strategy
+## Git Object Integrity
 
-Applied commits go to a "local" branch:
+With the fetch-based approach, git objects maintain proper integrity:
 
-```
-main (from clone)
-  └── local (SSE commits applied here)
-```
+| Object | OID Matches Upstream |
+|--------|---------------------|
+| Blobs | Yes (fetched) |
+| Trees | Yes (fetched) |
+| Commits | Yes (fetched) |
 
-This separates upstream history from locally-applied changes.
+This enables:
+- Accurate `readCommit(oid)` lookups
+- Proper diff viewing between any commits
+- Consistent history navigation
+- File content at any commit via `readFileAtCommit()`
