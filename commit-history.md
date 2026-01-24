@@ -1,153 +1,128 @@
-# Commit History & Timelines
+# Commit History
 
-How commit history is tracked and displayed.
+How commit history is managed in the browser git repo.
 
-## Two Types of Timelines
+## Initial Clone Depth
 
-### Repo Timeline
-
-All commits for the active repository, shown in the sidebar:
+Repos are cloned with `depth: 50` for efficiency:
 
 ```typescript
-const repoTimeline: GitCommit[] = [
-  { oid: "abc123", message: "Update docs", timestamp: 1706000000 },
-  { oid: "def456", message: "Add new page", timestamp: 1705900000 },
-  // ...
-];
+await git.clone({
+  fs: this.fs,
+  http,
+  dir: this.dir,
+  url,
+  ref: "main",
+  singleBranch: true,
+  depth: 50,
+});
 ```
 
-Loaded when a repository becomes active. Cached per repo to prevent reloading when navigating between files.
+This provides recent history for most use cases while keeping initial load fast.
 
-### File Timeline
+## Fetching Deeper History
 
-Commits affecting the current file, shown in the version history panel:
+When accessing commits beyond the initial depth, the client automatically fetches more:
 
 ```typescript
-const fileTimeline: GitCommit[] = [
-  { oid: "abc123", message: "Update getting started guide", timestamp: 1706000000 },
-  { oid: "xyz789", message: "Fix typo", timestamp: 1704000000 },
-];
+private async fetchDeeperHistory(): Promise<boolean> {
+  try {
+    const url = getGitUrl(this.repoSlug);
+    await git.fetch({
+      fs: this.fs,
+      http,
+      dir: this.dir,
+      url,
+      ref: "main",
+      singleBranch: true,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
 ```
 
-Loaded when the current file changes.
+This is called transparently when:
+- `readFileAtCommit()` fails for an older commit
+- `getCommitFiles()` fails for an older commit  
+- `getCommitInfo()` fails for an older commit
 
-## Loading Commit History
-
-### Local History
+## Example: Reading Older Commits
 
 ```typescript
-async log(depth: number = 100): Promise<GitCommit[]> {
-  const commits = await git.log({
-    fs: this.fs,
-    dir: this.dir,
-    depth
-  });
-  
-  return commits.map(c => ({
+async readFileAtCommit(filepath: string, oid: string): Promise<string | null> {
+  try {
+    // Try local first
+    const { blob } = await git.readBlob({ ... });
+    return new TextDecoder().decode(blob);
+  } catch {
+    // Commit not in local history - fetch more
+    const fetched = await this.fetchDeeperHistory();
+    if (!fetched) return null;
+    
+    // Retry with deeper history
+    try {
+      const { blob } = await git.readBlob({ ... });
+      return new TextDecoder().decode(blob);
+    } catch {
+      return null;
+    }
+  }
+}
+```
+
+## No API Fallbacks
+
+All history access uses proper git operations:
+
+| Operation | Approach |
+|-----------|----------|
+| Read file at commit | `git.readBlob()` with auto-fetch |
+| Get commit files | `git.walk()` with auto-fetch |
+| Get commit info | `git.readCommit()` with auto-fetch |
+| View diff | Uses local git objects |
+
+This ensures:
+- Git object integrity (OIDs match upstream)
+- Consistent behavior
+- No mixed local/API data
+
+## Timeline Display
+
+The timeline shows commits from local git log:
+
+```typescript
+async log(depth: number = 50): Promise<GitCommit[]> {
+  const commits = await git.log({ fs: this.fs, dir: this.dir, ref: "main", depth });
+  return commits.map((c) => ({
     oid: c.oid,
     message: c.commit.message,
     author: c.commit.author.name,
-    timestamp: c.commit.author.timestamp
+    timestamp: c.commit.author.timestamp * 1000,
   }));
-}
-```
-
-### GitHub History Integration
-
-Local history may be incomplete (shallow clone). GitHub API provides full history:
-
-```typescript
-async getGitHubHistory(): Promise<GitCommit[]> {
-  // Check cache (5-minute TTL)
-  if (this.githubHistoryCache && !this.isCacheExpired()) {
-    return this.githubHistoryCache;
-  }
-  
-  // Fetch from API
-  const response = await fetch(`/api/repo-history?repo=${this.repoSlug}`);
-  const { commits } = await response.json();
-  
-  this.githubHistoryCache = commits;
-  return commits;
-}
-```
-
-### Merged History
-
-Local and GitHub commits are merged, with duplicates removed:
-
-```typescript
-async getFullHistory(): Promise<GitCommit[]> {
-  const [local, github] = await Promise.all([
-    this.log(),
-    this.getGitHubHistory()
-  ]);
-  
-  // Merge and dedupe by OID
-  const seen = new Set<string>();
-  const merged: GitCommit[] = [];
-  
-  for (const commit of [...local, ...github]) {
-    if (!seen.has(commit.oid)) {
-      seen.add(commit.oid);
-      merged.push(commit);
-    }
-  }
-  
-  // Sort by timestamp descending
-  return merged.sort((a, b) => b.timestamp - a.timestamp);
 }
 ```
 
 ## File History
 
-Getting commits that affected a specific file:
+File-specific history filters commits that touched a particular file:
 
 ```typescript
 async getFileHistory(filepath: string, depth: number = 50): Promise<GitCommit[]> {
-  const allCommits = await this.log(depth);
-  const fileCommits: GitCommit[] = [];
-  
-  for (const commit of allCommits) {
-    const files = await this.getCommitFiles(commit.oid);
-    if (files.has(filepath)) {
-      fileCommits.push(commit);
+  const result: GitCommit[] = [];
+  const commits = await git.log({ fs: this.fs, dir: this.dir, ref: "main", depth });
+
+  for (const commit of commits) {
+    try {
+      // Check if file exists at this commit
+      await git.readBlob({ fs: this.fs, dir: this.dir, oid: commit.oid, filepath });
+      result.push({ ... });
+    } catch {
+      // File didn't exist at this commit - skip
     }
   }
-  
-  return fileCommits;
+
+  return result;
 }
 ```
-
-## UI Components
-
-### Sidebar Timeline
-
-Shows repo commits with:
-- Commit message (truncated)
-- Relative timestamp ("2 hours ago")
-- Click to view diff
-
-### File Versions Panel
-
-Shows file-specific history:
-- Expandable list (1 by default)
-- Author and timestamp
-- Click to view that version's diff
-
-## Stale-While-Revalidate
-
-Timelines use a stale-while-revalidate pattern:
-
-```typescript
-// Show cached data immediately
-if (cachedTimeline) {
-  setRepoTimeline(cachedTimeline);
-}
-
-// Fetch fresh data in background
-const freshTimeline = await repo.log();
-setRepoTimeline(freshTimeline);
-```
-
-This prevents loading flashes when navigating.
