@@ -32,13 +32,34 @@ Quick reference to the main files involved in git integration.
 
 ## MCP Server
 
+Uses `simple-git` (native git) for all git operations. Write operations stage changes without auto-committing.
+
+### Core Git
+
 | File | Purpose |
 |------|---------- |
-| `operations/git.ts` | Git operations (status, commit, push) |
-| `operations/files.ts` | File read/write operations |
+| `lib/worktree.ts` | Per-user worktree isolation, staging, commit/push workflow |
+| `lib/askpass.ts` | GIT_ASKPASS script management for token auth |
+| `operations/git.ts` | Git tools: status, commit, push, log, commit_changes |
+| `operations/repos.ts` | Repo initialization, clone, fetch, pull |
+
+### Write Operations (stage-only)
+
+| File | Purpose |
+|------|---------- |
+| `operations/files.ts` | File write/delete/rename - stages only, returns terse JSON |
+| `operations/tickets.ts` | Ticket create/update - stages only, returns terse JSON |
+| `operations/boards.ts` | Board create/modify - stages only, returns terse JSON |
+| `operations/timelines.ts` | Timeline create/add entry - stages only, returns terse JSON |
+
+### Infrastructure
+
+| File | Purpose |
+|------|---------- |
 | `tools/workspaces.ts` | Workspace tools with SSE event emission |
 | `lib/github.ts` | GitHub API for repo management |
 | `lib/events.ts` | Event emission for SSE |
+| `session.ts` | Session management with worktree tracking |
 
 ## Shared
 
@@ -48,6 +69,35 @@ Quick reference to the main files involved in git integration.
 | `packages/shared/src/db/schema.ts` | Database schema including repo members |
 
 ## Key Patterns
+
+### MCP Write Response Format
+
+All write operations return terse JSON with pending files:
+
+```typescript
+{
+  "success": true,
+  "path": "tickets/TKT-001.md",
+  "bytes_written": 256,
+  "pending_files": ["tickets/TKT-001.md"],
+  "hint": "1 file(s) pending. Call commit_changes when done."
+}
+```
+
+### Stage-Only Workflow
+
+```typescript
+// 1. Write stages the file (no commit, no push)
+await mcp.write({ file_path: "doc.md", contents: "..." });
+
+// 2. More writes accumulate in pending_files
+await mcp.write({ file_path: "other.md", contents: "..." });
+
+// 3. Explicit commit when ready
+await mcp.git_commit({ message: "Update docs" });
+// or
+await mcp.commit_changes({ message: "Update docs" });
+```
 
 ### Workspace Context
 
