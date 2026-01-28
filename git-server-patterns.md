@@ -10,7 +10,8 @@ When building a git proxy layer (like our MCP server), there are several product
 |---------|----------|----------|-----------------|
 | GitLab Gitaly | Go | RPC over native git | Process caching, pack-objects cache |
 | Soft Serve | Go | Multi-protocol server | Hook system, SQLite metadata |
-| Dugite / GitHub Desktop | Node.js | CLI wrapper | Concurrent/exclusive locks |
+| simple-git | Node.js | CLI wrapper + scheduler | Concurrency-limited task queue |
+| Dugite / GitHub Desktop | Node.js | CLI wrapper | Request deduplication |
 | Git HTTP Protocol | - | Stateless server | Client manages all state |
 
 ---
@@ -128,9 +129,133 @@ git push -u origin main
 
 ---
 
+## simple-git (Node.js)
+
+[simple-git](https://github.com/steveukx/git-js) is a mature Node.js wrapper around the git CLI with built-in task scheduling.
+
+### Architecture
+
+```
+Your Code
+    │
+    ▼
+SimpleGit API ──► GitExecutorChain ──► Scheduler ──► spawn()
+                        │
+                        └──► TasksPendingQueue (tracking)
+```
+
+### Key Patterns (from source code analysis)
+
+**1. Concurrency-Limited Scheduler**
+
+The `Scheduler` class limits concurrent git processes:
+
+```typescript
+// simple-git/src/lib/runners/scheduler.ts
+export class Scheduler {
+  private pending: ScheduledTask[] = [];
+  private running: ScheduledTask[] = [];
+
+  constructor(private concurrency = 2) {}
+
+  private schedule() {
+    // Only start new task if under concurrency limit
+    if (!this.pending.length || this.running.length >= this.concurrency) {
+      return;
+    }
+
+    const task = this.pending.shift()!;
+    this.running.push(task);
+    
+    task.done(() => {
+      remove(this.running, task);
+      this.schedule();  // Try next task
+    });
+  }
+
+  next(): Promise<ScheduleCompleteCallback> {
+    const task = createScheduledTask();
+    this.pending.push(task);
+    this.schedule();
+    return task.promise;
+  }
+}
+```
+
+Default concurrency is 2, configurable via `maxConcurrentProcesses`.
+
+**2. Promise Chain for Sequential Execution**
+
+Each executor chains tasks sequentially within its context:
+
+```typescript
+// simple-git/src/lib/runners/git-executor-chain.ts
+export class GitExecutorChain {
+  private _chain: Promise<any> = Promise.resolve();
+  private _queue = new TasksPendingQueue();
+
+  push<R>(task: SimpleGitTask<R>): Promise<R> {
+    this._queue.push(task);
+    // Chain tasks sequentially
+    return (this._chain = this._chain.then(() => this.attemptTask(task)));
+  }
+}
+```
+
+**3. Fatal Error Handling with Queue Purge**
+
+When a task fails fatally, the entire queue is purged:
+
+```typescript
+private onFatalException<R>(task: SimpleGitTask<R>, e: Error) {
+  const gitError = e instanceof GitError 
+    ? Object.assign(e, { task }) 
+    : new GitError(task, String(e));
+
+  // Reset chain and purge queue
+  this._chain = Promise.resolve();
+  this._queue.fatal(gitError);
+
+  return gitError;
+}
+
+// In TasksPendingQueue
+fatal(err: GitError) {
+  for (const [task, { logger }] of this._queue.entries()) {
+    logger.info(`Fatal exception, queue purged`);
+    this.complete(task);
+  }
+}
+```
+
+**4. Plugin Architecture**
+
+Extensible via plugins for spawn customization:
+
+- `spawn.binary` - Custom git binary path
+- `spawn.args` - Modify arguments
+- `spawn.options` - Customize spawn options
+- `spawn.before` / `spawn.after` - Lifecycle hooks
+- `task.error` - Custom error handling
+
+```typescript
+const git = simpleGit({
+  maxConcurrentProcesses: 6,
+  config: ['core.autocrlf=false']
+});
+```
+
+### Relevance to TKT-025
+
+- **Ready-made concurrency control** - No need to build our own scheduler
+- **Error boundary pattern** - Fatal errors don't cascade
+- **Plugin system** - Can inject custom behavior (e.g., logging, auth)
+
+---
+
 ## Dugite / GitHub Desktop
 
-[Dugite](https://github.com/desktop/dugite) is GitHub Desktop's git library - a Node.js wrapper around the git CLI.
+[Dugite](https://github.com/desktop/dugite) is GitHub Desktop's git library - a thin Node.js wrapper around the git CLI.
 
 ### Architecture
 
@@ -144,27 +269,69 @@ GitHub Desktop (Electron)
     Bundled Git Binary
 ```
 
-- **CLI wrapper** - Calls git via `GitProcess.exec()`
+- **CLI wrapper** - Calls git via `exec()` from Node's child_process
 - **Bundles git** - Includes git binaries for Windows, macOS, Linux
 - **Production-proven** - Powers GitHub Desktop for millions of users
 
+### Source Code Analysis
+
+**Dugite itself is minimal** - just a wrapper around `execFile`:
+
+```typescript
+// dugite/lib/exec.ts
+export function exec(
+  args: string[],
+  path: string,
+  options?: IGitExecutionOptions
+): Promise<IGitResult> {
+  const { env, gitLocation } = setupEnvironment(options?.env ?? {});
+
+  return new Promise((resolve, reject) => {
+    const cp = execFile(gitLocation, args, {
+      cwd: path,
+      env,
+      encoding: options?.encoding ?? 'utf8',
+      maxBuffer: options?.maxBuffer ?? Infinity,
+    }, (err, stdout, stderr) => {
+      const exitCode = typeof err?.code === 'number' ? err.code : 0;
+      resolve({ stdout, stderr, exitCode });
+    });
+  });
+}
+```
+
+**Concurrency is handled at the application level** in GitHub Desktop:
+
+```typescript
+// GitHub Desktop's git-store.ts
+private readonly requestsInFight = new Set<string>();
+
+public async loadCommitBatch(commitish: string, skip: number) {
+  const requestKey = `commits-${commitish}-${skip}`;
+  
+  // Deduplicate concurrent requests
+  if (this.requestsInFight.has(requestKey)) {
+    return;
+  }
+  
+  this.requestsInFight.add(requestKey);
+  try {
+    // ... do work ...
+  } finally {
+    this.requestsInFight.delete(requestKey);
+  }
+}
+```
+
+**Note:** The [2015 blog post](https://github.blog/2015-10-20-git-concurrency-in-github-desktop/) about concurrent/exclusive locks was for the original C#/Objective-C codebase. The modern Electron version uses simpler patterns:
+
+1. **Request deduplication** via `Set` tracking
+2. **Error boundaries** via `performFailableOperation` wrapper
+3. **Single-threaded JS** - Electron's main process naturally serializes operations
+
 ### Key Patterns
 
-**1. Concurrent/Exclusive Locks**
-
-[GitHub's blog post](https://github.blog/2015-10-20-git-concurrency-in-github-desktop/) explains their concurrency model:
-
-```
-Problem: Multiple operations interleave → race conditions
-
-Solution: Lock at "unit of work" level
-- Concurrent locks: Multiple readers OK
-- Exclusive locks: Single writer
-```
-
-Before implementing locks, they had race conditions. After: stable and performant.
-
-**2. Credential Handling via GIT_ASKPASS**
+**1. Credential Handling via GIT_ASKPASS**
 
 ```javascript
 // Set env var pointing to credential helper
@@ -177,7 +344,7 @@ env.GIT_ASKPASS = '/path/to/credential-helper'
 
 No credentials stored in process memory or command args.
 
-**3. IGitResult Abstraction**
+**2. IGitResult Abstraction**
 
 ```typescript
 interface IGitResult {
@@ -195,9 +362,9 @@ if (result.exitCode !== 0) {
 
 ### Relevance to TKT-025
 
-- **Most directly applicable** - Same language (Node.js), same use case
-- Concurrent/exclusive lock pattern solves session isolation
+- Shows that simple patterns work at scale (millions of users)
 - GIT_ASKPASS for credentials is cleaner than passing tokens
+- Request deduplication is simpler than formal locks for many use cases
 
 ---
 
@@ -250,81 +417,104 @@ It handles:
 
 Based on this research:
 
-### Git Execution: CLI Wrapper
+### Git Execution: Use simple-git
 
-Use `simple-git` or direct shell execution (like Dugite and Gitaly do):
+simple-git provides everything we need out of the box:
 
 ```typescript
-// Option 1: simple-git
-import simpleGit from 'simple-git'
-const git = simpleGit(repoPath)
-await git.add('.')
-await git.commit('message')
+import simpleGit, { SimpleGit } from 'simple-git';
 
-// Option 2: Direct execution (more control)
-import { exec } from 'child_process'
-await exec('git add .', { cwd: repoPath })
+const git: SimpleGit = simpleGit(repoPath, {
+  maxConcurrentProcesses: 4,  // Limit concurrent git processes
+});
+
+// Operations are automatically queued and rate-limited
+await git.add('.');
+await git.commit('message');
+await git.push();
 ```
 
-**Why:** Production-proven, full git feature set, easier debugging.
+**Why:** Built-in scheduler, error handling, plugin system. Production-proven.
 
-### Session Isolation: Worktrees + Locks
+### Session Isolation: Worktrees
 
-Combine git worktrees with Dugite-style concurrent/exclusive locks:
+Each session gets its own worktree:
 
 ```typescript
-class SessionManager {
-  private locks = new Map<string, Lock>()
+async function createSessionWorktree(repoPath: string, sessionId: string) {
+  const git = simpleGit(repoPath);
+  const worktreePath = `/tmp/sessions/${sessionId}`;
+  const branchName = `session/${sessionId}`;
   
-  async withExclusiveLock<T>(
-    repoPath: string, 
-    fn: () => Promise<T>
-  ): Promise<T> {
-    const lock = this.getLock(repoPath)
-    await lock.acquireExclusive()
-    try {
-      return await fn()
-    } finally {
-      lock.release()
+  await git.raw(['worktree', 'add', worktreePath, '-b', branchName]);
+  
+  return simpleGit(worktreePath);
+}
+```
+
+**Why:** Filesystem-level isolation, no lock contention between sessions.
+
+### Credentials: GIT_ASKPASS
+
+```typescript
+import { writeFileSync, chmodSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+
+function createAskpassScript(token: string): string {
+  const script = join(tmpdir(), `askpass-${Date.now()}.sh`);
+  writeFileSync(script, `#!/bin/sh\necho "${token}"\n`);
+  chmodSync(script, 0o700);
+  return script;
+}
+
+// Use with simple-git
+const git = simpleGit(repoPath, {
+  config: [`credential.helper=`],  // Disable other helpers
+});
+
+await git.env('GIT_ASKPASS', createAskpassScript(token)).push();
+```
+
+**Why:** Secure, no tokens in command args or process memory.
+
+### Auto-Commit: Timeout with Debounce
+
+```typescript
+class SessionCommitManager {
+  private timers = new Map<string, NodeJS.Timeout>();
+  
+  scheduleCommit(sessionId: string, delay = 15_000) {
+    // Cancel existing timer
+    const existing = this.timers.get(sessionId);
+    if (existing) clearTimeout(existing);
+    
+    // Schedule new timer
+    const timer = setTimeout(() => {
+      this.commitAndPush(sessionId);
+      this.timers.delete(sessionId);
+    }, delay);
+    
+    this.timers.set(sessionId, timer);
+  }
+  
+  cancelScheduledCommit(sessionId: string) {
+    const timer = this.timers.get(sessionId);
+    if (timer) {
+      clearTimeout(timer);
+      this.timers.delete(sessionId);
     }
   }
 }
 ```
 
-**Why:** Worktrees provide filesystem isolation; locks prevent race conditions.
-
-### Credentials: GIT_ASKPASS
-
-```typescript
-// Create temp script that echoes the token
-const askpass = createAskpassScript(token)
-const env = { GIT_ASKPASS: askpass }
-
-await git.push({ env })
-```
-
-**Why:** Secure, no tokens in command args or process memory.
-
-### Auto-Commit: Hook-Inspired Timeout
-
-Model the timeout as a synthetic hook:
-
-```typescript
-// After any write operation
-scheduleAutoCommit(sessionId, {
-  delay: 15_000,  // 15 seconds
-  onTrigger: () => commitAndPush(sessionId),
-  cancelOn: ['explicit_commit', 'new_write']
-})
-```
-
-**Why:** Soft Serve's hook model shows this is a natural extension point.
+**Why:** Simple, debounced, matches observed MCP request patterns.
 
 ### State Management: Stateless Server
 
 Keep session state in:
 1. Worktree on disk (git state)
-2. SQLite/memory (session metadata)
+2. In-memory Map (session metadata, timers)
 
 Don't require:
 - Sticky sessions
@@ -335,13 +525,26 @@ Don't require:
 
 ---
 
+## Implementation Comparison
+
+| Aspect | isomorphic-git (current) | simple-git (proposed) |
+|--------|-------------------------|----------------------|
+| Concurrency | None (single-threaded) | Built-in scheduler |
+| Worktrees | Not supported | Full support |
+| Error handling | Manual | Built-in with queue purge |
+| Hooks | Not applicable | Plugin system |
+| Bundle size | ~200KB | ~50KB (wrapper only) |
+| Git binary | Bundled JS implementation | System git required |
+
+---
+
 ## References
 
 - [GitLab Gitaly Documentation](https://docs.gitlab.com/administration/gitaly/)
 - [Gitaly Protocol Docs](https://gitlab-org.gitlab.io/gitaly/)
 - [Soft Serve GitHub](https://github.com/charmbracelet/soft-serve)
+- [simple-git GitHub](https://github.com/steveukx/git-js)
 - [Dugite GitHub](https://github.com/desktop/dugite)
-- [Git Concurrency in GitHub Desktop](https://github.blog/2015-10-20-git-concurrency-in-github-desktop/)
+- [Git Concurrency in GitHub Desktop (2015)](https://github.blog/2015-10-20-git-concurrency-in-github-desktop/)
 - [Git HTTP Protocol](https://git-scm.com/docs/http-protocol)
 - [Git Smart HTTP](https://git-scm.com/book/en/v2/Git-on-the-Server-Smart-HTTP)
-- [simple-git npm](https://www.npmjs.com/package/simple-git)
